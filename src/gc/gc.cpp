@@ -21,6 +21,10 @@
 
 #define USE_INTROSORT
 
+static double bytes_to_mb(size_t bytes) {
+    return ((double)bytes) / ((double)(1<<20));
+}
+
 // We just needed a simple random number generator for testing.
 class gc_rand
 {
@@ -513,8 +517,8 @@ size_t max_gc_buffers = 0;
 
 static CLRCriticalSection gc_log_lock;
 
-// we keep this much in a buffer and only flush when the buffer is full
-#define gc_log_buffer_size (1024*1024)
+// we keep this much in a buffer and only flush when the buffer is full (16KB)
+#define gc_log_buffer_size (16*1024)
 uint8_t* gc_log_buffer = 0;
 size_t gc_log_buffer_offset = 0;
 
@@ -13660,14 +13664,14 @@ try_again:
                             }
                         }
                     }
-                    dprintf (3, ("Switching context %p (home heap %d) ", 
+                    dprintf (LOGME, ("Switching context %p (home heap %d) ", 
                                  acontext,
                         acontext->get_home_heap()->pGenGCHeap->heap_number));
-                    dprintf (3, (" from heap %d (%Id free bytes, %d contexts) ", 
+                    dprintf (LOGME, (" from heap %d (%Id free bytes, %d contexts) ", 
                                  org_hp->heap_number,
                                  org_size,
                                  org_alloc_context_count));
-                    dprintf (3, (" to heap %d (%Id free bytes, %d contexts)\n", 
+                    dprintf (LOGME, (" to heap %d (%Id free bytes, %d contexts)\n", 
                                  max_hp->heap_number,
                                  dd_new_allocation(max_hp->dynamic_data_of(0)),
                                                    max_alloc_context_count));
@@ -13681,7 +13685,7 @@ try_again:
 gc_heap* gc_heap::balance_heaps_loh (alloc_context* acontext, size_t alloc_size)
 {
     gc_heap* org_hp = acontext->get_alloc_heap()->pGenGCHeap;
-    dprintf (3, ("[h%d] LA: %Id", org_hp->heap_number, alloc_size));
+    dprintf (LOGME, ("[h%d] balance_heaps_loh alloc_size: %lf", org_hp->heap_number, bytes_to_mb(alloc_size)));
 
     //if (size > 128*1024)
     if (1)
@@ -13692,6 +13696,10 @@ gc_heap* gc_heap::balance_heaps_loh (alloc_context* acontext, size_t alloc_size)
         gc_heap* max_hp;
         ptrdiff_t max_size;
         size_t delta = dd_min_size (dd) * 4;
+        if (heap_hard_limit)
+        {
+            delta = min(delta, heap_hard_limit / 20);
+        }
 
         int start, end, finish;
         heap_select::get_heap_range_for_heap(org_hp->heap_number, &start, &end);
@@ -13701,23 +13709,23 @@ try_again:
         {
             max_hp = org_hp;
             max_size = org_size + delta;
-            dprintf (3, ("orig hp: %d, max size: %d",
+            dprintf (LOGME, ("balance_heaps_loh orig hp: [h%d], max size: %f, start: %d, end: %d",
                 org_hp->heap_number,
-                max_size));
+                bytes_to_mb(max_size),
+                start,
+                end));
 
             for (int i = start; i < end; i++)
             {
                 gc_heap* hp = GCHeap::GetHeap(i%n_heaps)->pGenGCHeap;
                 dd = hp->dynamic_data_of (max_generation + 1);
                 ptrdiff_t size = dd_new_allocation (dd);
-                dprintf (3, ("hp: %d, size: %d",
-                    hp->heap_number,
-                    size));
+                //dprintf (LOGME, ("hp: %d, size: %d", hp->heap_number, size));
                 if (size > max_size)
                 {
                     max_hp = hp;
                     max_size = size;
-                    dprintf (3, ("max hp: %d, max size: %d",
+                    dprintf (LOGME, ("SWITCHING HEAPS! max hp: %d, max size: %d",
                         max_hp->heap_number,
                         max_size));
                 }
@@ -13733,9 +13741,9 @@ try_again:
 
         if (max_hp != org_hp)
         {
-            dprintf (3, ("loh: %d(%Id)->%d(%Id)", 
-                org_hp->heap_number, dd_new_allocation (org_hp->dynamic_data_of (max_generation + 1)),
-                max_hp->heap_number, dd_new_allocation (max_hp->dynamic_data_of (max_generation + 1))));
+            dprintf (LOGME, ("loh: [h%d](%f)->[h%d](%f)", 
+                org_hp->heap_number, bytes_to_mb(dd_new_allocation (org_hp->dynamic_data_of (max_generation + 1))),
+                max_hp->heap_number, bytes_to_mb(dd_new_allocation (max_hp->dynamic_data_of (max_generation + 1)))));
         }
 
         return max_hp;
@@ -13745,6 +13753,52 @@ try_again:
         return org_hp;
     }
 }
+
+// Unlike balance_heaps_loh, this may return NULL if we failed to change heaps
+gc_heap* gc_heap::balance_heaps_loh_hard_limit_retry (alloc_context* acontext, size_t alloc_size)
+{
+    gc_heap* org_hp = acontext->get_alloc_heap()->pGenGCHeap;
+    dprintf (LOGME, ("[h%d] balance_heaps_loh_hard_limit_retry alloc_size: %f", org_hp->heap_number, bytes_to_mb(alloc_size)));
+
+    assert (heap_hard_limit);
+
+    int start, end, finish;
+    heap_select::get_heap_range_for_heap (org_hp->heap_number, &start, &end);
+    finish = start + n_heaps;
+
+    gc_heap* max_hp = NULL;
+    size_t max_end_of_seg_space = alloc_size - 1; // Must be more than this much, or return NULL
+
+try_again:
+    {
+        dprintf (LOGME, ("org hp: [h%d], max_end_of_seg_space: %f",
+            org_hp->heap_number,
+            bytes_to_mb(max_end_of_seg_space)));
+
+        for (int i = start; i < end; i++)
+        {
+            gc_heap* hp = GCHeap::GetHeap (i%n_heaps)->pGenGCHeap;
+            heap_segment* seg = generation_start_segment (hp->generation_of (max_generation + 1));
+            assert (heap_segment_next (seg) == NULL);
+            size_t end_of_seg_space = heap_segment_reserved (seg) - heap_segment_allocated (seg);
+            // dprintf (LOGME, ("heap %d, end_of_seg_space %d", hp->heap_number, bytes_to_mb(end_of_seg_space)));
+            if (end_of_seg_space > max_end_of_seg_space)
+            {
+                dprintf (LOGME, ("Switching heaps in hard_limit_retry! To: [h%d], New end_of_seg_space: %f", hp->heap_number, bytes_to_mb(end_of_seg_space)));
+                max_end_of_seg_space = end_of_seg_space;
+                max_hp = hp;
+            }
+        }
+    }
+
+    if ((max_hp == NULL) && (end < finish))
+    {
+        start = end; end = finish;
+        goto try_again;
+    }
+
+    return max_hp;
+}
 #endif //MULTIPLE_HEAPS
 
 BOOL gc_heap::allocate_more_space(alloc_context* acontext, size_t size,
@@ -13752,7 +13806,7 @@ BOOL gc_heap::allocate_more_space(alloc_context* acontext, size_t size,
 {
     allocation_state status;
     do
-    { 
+    {
 #ifdef MULTIPLE_HEAPS
         if (alloc_generation_number == 0)
         {
@@ -13761,11 +13815,25 @@ BOOL gc_heap::allocate_more_space(alloc_context* acontext, size_t size,
         }
         else
         {
-            gc_heap* alloc_heap = balance_heaps_loh (acontext, size);
+            //assert(heap_number == acontext->get_alloc_heap()->pGenGCHeap->heap_number);
+            dprintf (LOGME, ("LOH [h%d] allocate_more_space %f", heap_number, bytes_to_mb(size)));
+            gc_heap* alloc_heap;
+            if (heap_hard_limit && status == a_state_retry_allocate)
+            {
+                alloc_heap = balance_heaps_loh_hard_limit_retry (acontext, size);
+                if (alloc_heap == NULL)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                alloc_heap = balance_heaps_loh (acontext, size);
+            }
             status = alloc_heap->try_allocate_more_space (acontext, size, alloc_generation_number);
             if (status == a_state_retry_allocate)
             {
-                dprintf (3, ("LOH h%d alloc retry!", alloc_heap->heap_number));
+                dprintf (LOGME, ("LOH h%d alloc retry!", alloc_heap->heap_number));
             }
         }
 #else
@@ -13780,6 +13848,11 @@ BOOL gc_heap::allocate_more_space(alloc_context* acontext, size_t size,
 inline
 CObjectHeader* gc_heap::allocate (size_t jsize, alloc_context* acontext)
 {
+#ifdef MULTIPLE_HEAPS
+    assert (acontext->get_alloc_heap()->pGenGCHeap->heap_number == heap_number);
+    // dprintf (LOGME, ("allocate %f on %d", bytes_to_mb(jsize), heap_number)); / too verbose
+#endif
+
     size_t size = Align (jsize);
     assert (size >= Align (min_obj_size));
     {
@@ -14798,10 +14871,17 @@ int gc_heap::joined_generation_to_condemn (BOOL should_evaluate_elevation,
         dprintf (GTC_LOG, ("committed %Id is %d%% of limit %Id", 
             current_total_committed, (int)((float)current_total_committed * 100.0 / (float)heap_hard_limit),
             heap_hard_limit));
-        if ((current_total_committed * 10) >= (heap_hard_limit * 9))
-        {
-            bool full_compact_gc_p = false;
 
+        bool full_compact_gc_p = false;
+
+        if (joined_last_gc_before_oom)
+        {
+            full_compact_gc_p = true;
+        }
+
+        else if ((current_total_committed * 10) >= (heap_hard_limit * 9))
+        {
+        
             size_t loh_frag = get_total_gen_fragmentation (max_generation + 1);
             
             // If the LOH frag is >= 1/8 it's worth compacting it
@@ -14819,13 +14899,14 @@ int gc_heap::joined_generation_to_condemn (BOOL should_evaluate_elevation,
                 dprintf (GTC_LOG, ("loh est reclaim: %Id, 1/8 of limit %Id", est_loh_reclaim, (heap_hard_limit / 8)));
             }
 
-            if (full_compact_gc_p)
-            {
-                n = max_generation;
-                *blocking_collection_p = TRUE;
-                settings.loh_compaction = TRUE;
-                dprintf (GTC_LOG, ("compacting LOH due to hard limit"));
-            }
+        }
+
+        if (full_compact_gc_p)
+        {
+            n = max_generation;
+            *blocking_collection_p = TRUE;
+            settings.loh_compaction = TRUE;
+            dprintf (GTC_LOG, ("compacting LOH due to hard limit"));
         }
     }
 
@@ -30108,6 +30189,11 @@ void gc_heap::init_static_data()
         static_data_table[i][0].min_size = gen0_min_size;
         static_data_table[i][0].max_size = gen0_max_size;
         static_data_table[i][1].max_size = gen1_max_size;
+
+        if (heap_hard_limit)
+        {
+            static_data_table[i][max_generation + 1].min_size = min_loh_segment_size / 8;
+        }
     }
 }
 
@@ -31217,13 +31303,21 @@ BOOL gc_heap::ephemeral_gen_fit_p (gc_tuning_point tp)
 
 CObjectHeader* gc_heap::allocate_large_object (size_t jsize, int64_t& alloc_bytes)
 {
+#ifdef MULTIPLE_HEAPS
+    // NOTE: alloc_bytes is not the # bytes to allocate, it's the number of bytes allocated on this heap so far
+    dprintf (LOGME, ("[h%d]allocate_large_object, %f", heap_number, bytes_to_mb(jsize)));
+#endif
+
     //create a new alloc context because gen3context is shared.
     alloc_context acontext;
     acontext.alloc_ptr = 0;
     acontext.alloc_limit = 0;
     acontext.alloc_bytes = 0;
+    acontext.gc_reserved_1 = 0;
+    acontext.gc_reserved_2 = 0;
 #ifdef MULTIPLE_HEAPS
-    acontext.set_alloc_heap(vm_heap);
+    //acontext.set_alloc_heap(vm_heap);
+    GCHeap::AssignHeap (&acontext);
 #endif //MULTIPLE_HEAPS
 
 #if BIT64
@@ -34145,6 +34239,8 @@ HRESULT AllocateCFinalize(CFinalize **pCFinalize)
 // init the instance heap
 HRESULT GCHeap::Init(size_t hn)
 {
+    dprintf(LOGME, ("Initiailizing the heap %d", hn));
+
     HRESULT hres = S_OK;
 
 #ifdef MULTIPLE_HEAPS
@@ -34299,7 +34395,7 @@ HRESULT GCHeap::Initialize()
     {
         seg_size = gc_heap::get_segment_size_hard_limit (&nhp, (nhp_from_config == 0));
         gc_heap::soh_segment_size = seg_size;
-        large_seg_size = seg_size * 2;
+        large_seg_size = seg_size;
     }
     else
     {
@@ -36171,9 +36267,17 @@ size_t GCHeap::ApproxTotalBytesInUse(BOOL small_heap_only)
 #ifdef MULTIPLE_HEAPS
 void GCHeap::AssignHeap (alloc_context* acontext)
 {
+    int home_hn = -1;
+    if (acontext->get_home_heap() != 0)
+    {
+     home_hn = acontext->get_home_heap()->pGenGCHeap->heap_number;
+    }
+
     // Assign heap based on processor
     acontext->set_alloc_heap(GetHeap(heap_select::select_heap(acontext, 0)));
     acontext->set_home_heap(acontext->get_alloc_heap());
+
+    dprintf (LOGME, ("assign home %d->%d", home_hn,  acontext->get_home_heap()->pGenGCHeap->heap_number));
 }
 GCHeap* GCHeap::GetHeap (int n)
 {
