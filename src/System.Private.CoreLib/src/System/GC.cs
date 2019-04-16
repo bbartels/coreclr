@@ -60,6 +60,21 @@ namespace System
                                                   out UIntPtr lastRecordedHeapSize,
                                                   out UIntPtr lastRecordedFragmentation);
 
+        public static GCMemoryInfo GetGCMemoryInfo()
+        {
+            GetMemoryInfo(out uint highMemLoadThreshold,
+                          out ulong totalPhysicalMem,
+                          out uint lastRecordedMemLoad,
+                          out UIntPtr lastRecordedHeapSize,
+                          out UIntPtr lastRecordedFragmentation);
+
+            return new GCMemoryInfo((long)((double)highMemLoadThreshold / 100 * totalPhysicalMem),
+                                    (long)((double)lastRecordedMemLoad / 100 * totalPhysicalMem),
+                                    (long)totalPhysicalMem,
+                                    (long)(ulong)lastRecordedHeapSize,
+                                    (long)(ulong)lastRecordedFragmentation);
+        }
+
         [DllImport(JitHelpers.QCall, CharSet = CharSet.Unicode)]
         internal static extern int _StartNoGCRegion(long totalSize, bool lohSizeKnown, long lohSize, bool disallowFullBlockingGC);
 
