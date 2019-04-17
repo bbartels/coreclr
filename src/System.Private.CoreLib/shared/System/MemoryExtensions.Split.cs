@@ -13,7 +13,7 @@ namespace System
         /// <param name="span">The source span which should be iterated over.</param>
         /// <param name="separator">The separator used to separate the <paramref name="span"/>.</param>
         /// <param name="options">The <see cref="StringSplitOptions"/> which should be applied with this operation.</param>
-        /// <returns></returns>
+        /// <returns>Returns an enumerator for the specified sequence.</returns>
         public static SpanSplitEnumerator<T> Split<T>(this ReadOnlySpan<T> span,
             T separator, StringSplitOptions options = StringSplitOptions.None) where T : IEquatable<T>
         {
@@ -42,7 +42,7 @@ namespace System
         /// <summary>
         /// Returns the current enumerator.
         /// </summary>
-        /// <returns></returns>
+        /// <returns>Returns the current enumerator.</returns>
         public SpanSplitEnumerator<T> GetEnumerator() => this;
 
         internal SpanSplitEnumerator(ReadOnlySpan<T> span, T separator, bool removeEmptyEntries)
@@ -56,7 +56,7 @@ namespace System
         /// <summary>
         /// Advances the enumerator to the next element in the <see cref="ReadOnlySpan{T}"/>.
         /// </summary>
-        /// <returns></returns>
+        /// <returns>Returns whether there is another item in the enumerator.</returns>
         public bool MoveNext()
         {
             if (IsFinished) { return false; }
@@ -67,7 +67,6 @@ namespace System
                 if (index < 0)
                 {
                     Current = _sequence;
-                    _sequence = ReadOnlySpan<T>.Empty;
                     _spanSplitInfo |= SpanSplitInfo.FinishedEnumeration;
                     return !(ShouldRemoveEmptyEntries && Current.IsEmpty);
                 }
